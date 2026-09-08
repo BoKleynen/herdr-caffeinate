@@ -1,4 +1,4 @@
-id = "local.caffeinate"
+id = "herdr-caffeinate"
 name = "Herdr Caffeinate"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
