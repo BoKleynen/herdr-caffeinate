@@ -1,0 +1,12 @@
+id = "local.caffeinate"
+name = "Herdr Caffeinate"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Prevents macOS system sleep while any Herdr agent is actively working."
+platforms = ["macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[startup]]
+command = ["./target/release/herdr-caffeinate"]
