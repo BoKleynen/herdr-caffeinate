@@ -1,8 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command};
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -64,6 +67,17 @@ struct SubscriptionEvent {
     data: AgentStatusChanged,
 }
 
+enum HerdrMessage {
+    Lifecycle(Value),
+    Status(AgentStatusChanged),
+    SocketClosed { pane_id: Option<String> },
+}
+
+struct StatusSubscription {
+    control: UnixStream,
+    thread: JoinHandle<()>,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -96,6 +110,9 @@ fn main() -> Result<()> {
     }
     info!(pane_count = agent_states.len(), "loaded session snapshot");
 
+    let (sender, receiver) = mpsc::channel();
+    let lifecycle_thread = spawn_lifecycle_reader(event_reader, sender.clone());
+    let mut status_subscriptions = HashMap::new();
     let mut caffeinate_child = None;
     debug!(
         pane_count = agent_states.len(),
@@ -104,51 +121,45 @@ fn main() -> Result<()> {
     );
     update_caffeinate(&agent_states, &mut caffeinate_child);
 
-    let mut subscribed_panes = HashSet::new();
     for line in buffered_events {
-        if let Err(error) = handle_event(
-            &line,
-            &mut event_writer,
-            &mut subscribed_panes,
-            &mut agent_states,
-            &mut caffeinate_child,
-        ) {
+        if let Some(message) = parse_lifecycle_message(&line)?
+            && let Err(error) = handle_message(
+                message,
+                &socket_path,
+                &sender,
+                &mut status_subscriptions,
+                &mut agent_states,
+                &mut caffeinate_child,
+            )
+        {
             warn!(error = %error, "ignoring buffered Herdr message");
         }
     }
-    for pane_id in agent_states.keys() {
-        subscribe_to_pane(&mut event_writer, &mut subscribed_panes, pane_id)?;
+    for pane_id in agent_states.keys().cloned().collect::<Vec<_>>() {
+        ensure_status_subscription(&socket_path, &pane_id, &sender, &mut status_subscriptions);
     }
 
-    let mut line = String::new();
-    let event_result = loop {
-        match event_reader.read_line(&mut line) {
-            Ok(0) => {
-                info!("event socket closed");
-                break Ok(());
-            }
-            Ok(_) => {
-                if let Err(error) = handle_event(
-                    &line,
-                    &mut event_writer,
-                    &mut subscribed_panes,
-                    &mut agent_states,
-                    &mut caffeinate_child,
-                ) {
-                    warn!(error = %error, "ignoring Herdr message");
-                }
-                line.clear();
-            }
-            Err(error) => {
-                error!(error = %error, "event socket read failed");
-                break Err(error.into());
-            }
+    while let Ok(message) = receiver.recv() {
+        if let Err(error) = handle_message(
+            message,
+            &socket_path,
+            &sender,
+            &mut status_subscriptions,
+            &mut agent_states,
+            &mut caffeinate_child,
+        ) {
+            warn!(error = %error, "ignoring Herdr message");
         }
-    };
+    }
 
+    for (_, subscription) in status_subscriptions {
+        let _ = subscription.control.shutdown(Shutdown::Both);
+        let _ = subscription.thread.join();
+    }
+    let _ = lifecycle_thread.join();
     stop_caffeinate(&mut caffeinate_child);
     info!("herdr-caffeinate stopped");
-    event_result
+    Ok(())
 }
 
 fn send_global_subscription(writer: &mut UnixStream) -> Result<()> {
@@ -172,29 +183,121 @@ fn write_request(writer: &mut UnixStream, request: &Value) -> Result<()> {
     Ok(())
 }
 
-fn subscribe_to_pane(
-    writer: &mut UnixStream,
-    subscribed_panes: &mut HashSet<String>,
+fn spawn_lifecycle_reader(
+    mut reader: BufReader<UnixStream>,
+    sender: Sender<HerdrMessage>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => match parse_lifecycle_message(&line) {
+                    Ok(Some(message)) => {
+                        if sender.send(message).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!(%error, "failed to parse lifecycle message"),
+                },
+                Err(error) => {
+                    error!(%error, "lifecycle socket read failed");
+                    break;
+                }
+            }
+        }
+        info!("lifecycle socket reader stopped");
+        let _ = sender.send(HerdrMessage::SocketClosed { pane_id: None });
+    })
+}
+
+fn spawn_status_subscription(
+    socket_path: &str,
     pane_id: &str,
-) -> Result<()> {
-    if !subscribed_panes.insert(pane_id.to_owned()) {
-        debug!(pane_id, "pane status subscription already exists");
-        return Ok(());
+    sender: &Sender<HerdrMessage>,
+) -> Result<StatusSubscription> {
+    let stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("connect status socket for pane {pane_id}"))?;
+    let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
+    let request_id = format!("status-subscription-{pane_id}");
+    write_request(
+        &mut writer,
+        &json!({
+            "id": request_id,
+            "method": "events.subscribe",
+            "params": {
+                "subscriptions": [{
+                    "type": "pane.agent_status_changed",
+                    "pane_id": pane_id
+                }]
+            }
+        }),
+    )?;
+    debug!(pane_id, request_id, "status subscription sent");
+
+    let buffered = wait_for_subscription_ack(&mut reader, &request_id)?;
+    for line in buffered {
+        if let Some(message) = parse_status_message(&line)? {
+            sender.send(message)?;
+        }
     }
 
-    let request = json!({
-        "id": format!("status-subscription-{pane_id}"),
-        "method": "events.subscribe",
-        "params": {
-            "subscriptions": [{
-                "type": "pane.agent_status_changed",
-                "pane_id": pane_id
-            }]
+    let thread_sender = sender.clone();
+    let thread_pane_id = pane_id.to_owned();
+    let thread = thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => match parse_status_message(&line) {
+                    Ok(Some(message)) => {
+                        if thread_sender.send(message).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(pane_id = %thread_pane_id, %error, "failed to parse status message");
+                    }
+                },
+                Err(error) => {
+                    error!(pane_id = %thread_pane_id, %error, "status socket read failed");
+                    break;
+                }
+            }
         }
+        info!(pane_id = %thread_pane_id, "status socket reader stopped");
+        let _ = thread_sender.send(HerdrMessage::SocketClosed {
+            pane_id: Some(thread_pane_id),
+        });
     });
-    debug!(pane_id, "subscribing to pane agent status changes");
-    write_request(writer, &request)
-        .with_context(|| format!("subscribe to pane agent status changes for {pane_id}"))
+
+    Ok(StatusSubscription {
+        control: writer,
+        thread,
+    })
+}
+
+fn ensure_status_subscription(
+    socket_path: &str,
+    pane_id: &str,
+    sender: &Sender<HerdrMessage>,
+    subscriptions: &mut HashMap<String, StatusSubscription>,
+) {
+    if subscriptions.contains_key(pane_id) {
+        return;
+    }
+    match spawn_status_subscription(socket_path, pane_id, sender) {
+        Ok(subscription) => {
+            subscriptions.insert(pane_id.to_owned(), subscription);
+            info!(pane_id, "status subscription active");
+        }
+        Err(error) => error!(pane_id, %error, "failed to start status subscription"),
+    }
 }
 
 fn wait_for_subscription_ack(
@@ -287,69 +390,87 @@ fn read_snapshot(socket_path: &str) -> Result<SessionSnapshot> {
     bail!("session.snapshot socket closed before returning a response")
 }
 
-fn handle_event(
-    line: &str,
-    writer: &mut UnixStream,
-    subscribed_panes: &mut HashSet<String>,
+fn handle_message(
+    message: HerdrMessage,
+    socket_path: &str,
+    sender: &Sender<HerdrMessage>,
+    subscriptions: &mut HashMap<String, StatusSubscription>,
     agent_states: &mut HashMap<String, AgentStatus>,
     caffeinate_child: &mut Option<Child>,
 ) -> Result<()> {
-    let message: Value = serde_json::from_str(line).context("parse event message")?;
-    if let Some(request_id) = message.get("id").and_then(Value::as_str) {
-        if let Some(error) = message.get("error") {
-            warn!(request_id, %error, "Herdr request returned an error");
-        } else {
-            let result_type = message
-                .get("result")
-                .and_then(|result| result.get("type"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            debug!(request_id, result_type, "Herdr request acknowledged");
-        }
-        return Ok(());
-    }
-
-    let Some(event) = message.get("event").and_then(Value::as_str) else {
-        trace!("ignored Herdr message without event or request ID");
-        return Ok(());
-    };
-    debug!(event, "received Herdr event");
-
-    match event {
-        event if is_pane_lifecycle_event(event) => {
+    match message {
+        HerdrMessage::Lifecycle(message) => {
             let event: HerdrEvent = serde_json::from_value(message)?;
             match event.data {
                 HerdrEventData::PaneCreated { pane } => {
                     let pane_id = pane.pane_id.clone();
                     info!(pane_id = %pane_id, status = ?pane.agent_status, "pane created");
                     agent_states.insert(pane_id.clone(), pane.agent_status);
-                    subscribe_to_pane(writer, subscribed_panes, &pane_id)?;
+                    ensure_status_subscription(socket_path, &pane_id, sender, subscriptions);
                 }
                 HerdrEventData::PaneClosed { pane_id } => {
                     info!(pane_id = %pane_id, "pane closed");
                     agent_states.remove(&pane_id);
-                    subscribed_panes.remove(&pane_id);
+                    if let Some(subscription) = subscriptions.remove(&pane_id) {
+                        let _ = subscription.control.shutdown(Shutdown::Both);
+                        let _ = subscription.thread.join();
+                    }
                 }
                 HerdrEventData::Other => {}
             }
         }
-        "pane.agent_status_changed" => {
-            let event: SubscriptionEvent = serde_json::from_value(message)?;
-            debug!(
-                pane_id = %event.data.pane_id,
-                status = ?event.data.agent_status,
-                "pane agent status changed"
-            );
-            update_agent_status(agent_states, &event.data);
+        HerdrMessage::Status(event) => {
+            debug!(pane_id = %event.pane_id, status = ?event.agent_status, "pane agent status changed");
+            apply_message(HerdrMessage::Status(event), agent_states);
         }
-        _ => {
-            trace!(event, "ignored Herdr event");
+        HerdrMessage::SocketClosed { pane_id: None } => {
+            info!("lifecycle socket reader stopped");
             return Ok(());
+        }
+        HerdrMessage::SocketClosed {
+            pane_id: Some(pane_id),
+        } => {
+            warn!(pane_id, "status socket reader stopped");
+            subscriptions.remove(&pane_id);
         }
     }
 
     update_caffeinate(agent_states, caffeinate_child);
     Ok(())
+}
+
+fn parse_lifecycle_message(line: &str) -> Result<Option<HerdrMessage>> {
+    let message: Value = serde_json::from_str(line).context("parse lifecycle message")?;
+    if message.get("id").is_some() {
+        return Ok(None);
+    }
+    if message
+        .get("event")
+        .and_then(Value::as_str)
+        .is_some_and(is_pane_lifecycle_event)
+    {
+        return Ok(Some(HerdrMessage::Lifecycle(message)));
+    }
+    trace!("ignored lifecycle message");
+    Ok(None)
+}
+
+fn parse_status_message(line: &str) -> Result<Option<HerdrMessage>> {
+    let message: Value = serde_json::from_str(line).context("parse status message")?;
+    if message.get("id").is_some() {
+        return Ok(None);
+    }
+    if message.get("event").and_then(Value::as_str) == Some("pane.agent_status_changed") {
+        let event: SubscriptionEvent = serde_json::from_value(message)?;
+        return Ok(Some(HerdrMessage::Status(event.data)));
+    }
+    Ok(None)
+}
+
+fn apply_message(message: HerdrMessage, statuses: &mut HashMap<String, AgentStatus>) {
+    if let HerdrMessage::Status(event) = message {
+        update_agent_status(statuses, &event);
+    }
 }
 
 fn snapshot_from_result(result: &Value) -> Result<SnapshotResponseResult> {
@@ -431,6 +552,36 @@ fn stop_caffeinate(child: &mut Option<Child>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routes_status_message_for_tracked_pane() {
+        let mut statuses = HashMap::from([(String::from("pane-1"), AgentStatus::Idle)]);
+
+        apply_message(
+            HerdrMessage::Status(AgentStatusChanged {
+                pane_id: String::from("pane-1"),
+                agent_status: AgentStatus::Working,
+            }),
+            &mut statuses,
+        );
+
+        assert_eq!(statuses["pane-1"], AgentStatus::Working);
+    }
+
+    #[test]
+    fn ignores_status_message_for_untracked_pane() {
+        let mut statuses = HashMap::new();
+
+        apply_message(
+            HerdrMessage::Status(AgentStatusChanged {
+                pane_id: String::from("closed-pane"),
+                agent_status: AgentStatus::Working,
+            }),
+            &mut statuses,
+        );
+
+        assert!(statuses.is_empty());
+    }
 
     #[test]
     fn recognizes_subscription_acknowledgement() {
