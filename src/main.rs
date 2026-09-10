@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsStr;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
@@ -11,6 +14,45 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, error, info, trace, warn};
+
+fn resolve_state_dir(state_dir: Option<&OsStr>, home_dir: Option<&Path>) -> Result<PathBuf> {
+    state_dir
+        .map(PathBuf::from)
+        .or_else(|| home_dir.map(|home| home.join(".local/state/herdr-caffeinate")))
+        .ok_or_else(|| anyhow!("HERDR_PLUGIN_STATE_DIR is unset and HOME is unavailable"))
+}
+
+fn log_filter(value: Option<&str>) -> Result<tracing_subscriber::EnvFilter> {
+    value
+        .map_or_else(
+            || Ok(tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_new,
+        )
+        .context("parse RUST_LOG")
+}
+
+fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let configured_state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR");
+    let home_dir = env::var_os("HOME").map(PathBuf::from);
+    let state_dir = resolve_state_dir(configured_state_dir.as_deref(), home_dir.as_deref())?;
+
+    fs::create_dir_all(&state_dir)
+        .with_context(|| format!("create plugin state directory {}", state_dir.display()))?;
+
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::NEVER)
+        .filename_prefix("herdr-caffeinate.log")
+        .build(&state_dir)
+        .with_context(|| format!("open log file in {}", state_dir.display()))?;
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let filter = log_filter(env::var("RUST_LOG").ok().as_deref())?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(writer)
+        .init();
+    Ok(guard)
+}
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -79,9 +121,7 @@ struct StatusSubscription {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let _logging_guard = init_logging()?;
 
     let socket_path =
         env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| "/tmp/herdr.sock".to_owned());
@@ -552,6 +592,53 @@ fn stop_caffeinate(child: &mut Option<Child>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::level_filters::LevelFilter;
+
+    #[test]
+    fn defaults_log_filter_to_info() {
+        assert_eq!(
+            log_filter(None).unwrap().max_level_hint(),
+            Some(LevelFilter::INFO)
+        );
+    }
+
+    #[test]
+    fn accepts_rust_log_override() {
+        assert_eq!(
+            log_filter(Some("debug")).unwrap().max_level_hint(),
+            Some(LevelFilter::DEBUG)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_rust_log() {
+        assert!(
+            log_filter(Some("=not-a-level"))
+                .unwrap_err()
+                .to_string()
+                .contains("parse RUST_LOG")
+        );
+    }
+
+    #[test]
+    fn uses_configured_state_directory() {
+        let path = resolve_state_dir(Some(OsStr::new("/tmp/herdr-state")), None).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/herdr-state"));
+    }
+
+    #[test]
+    fn falls_back_to_home_state_directory() {
+        let path = resolve_state_dir(None, Some(Path::new("/Users/tester"))).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/tester/.local/state/herdr-caffeinate")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_state_directory_and_home() {
+        assert!(resolve_state_dir(None, None).is_err());
+    }
 
     #[test]
     fn routes_status_message_for_tracked_pane() {
